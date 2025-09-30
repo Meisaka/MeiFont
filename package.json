@@ -1,0 +1,25 @@
+{
+  "name": "MeiFont",
+  "version": "0.1.0",
+  "description": "Thing for maybe editing and rendering Fonts, probably",
+  "main": "raster.js",
+  "dependencies": { },
+  "devDependencies": {
+    "typescript": "5.8.3",
+    "vite": "7.0.2"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Meisaka/MeiFont.git"
+  },
+  "keywords": [ ],
+  "author": "Meisaka Yukara",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/Meisaka/MeiFont/issues"
+  },
+  "homepage": "https://github.com/Meisaka/MeiFont"
+}

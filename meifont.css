@@ -1,0 +1,57 @@
+body {
+	color: #cbcbce;
+	background-color: #34343e;
+}
+.ERR {
+	background-color: #6f0000;
+	border-left: #ffc344 solid 4px;
+}
+.INSTR {
+	font-family: monospace;
+	flex-grow: 1;
+}
+.MACRO {
+	color: #525da9;
+	font-weight: bold;
+}
+.OPC {
+	color: #c5531a;
+}
+.IDENT {
+	color: #88ff76;
+}
+.LABEL {
+	color: #99c17e;
+}
+.output {
+	font-family: monospace;
+    word-break: break-word;
+}
+.asmsg {
+	text-align: right;
+	align-self: flex-end;
+	flex-grow: 2;
+}
+#msg {
+	font-family: monospace;
+	padding: 4px;
+}
+#msg div {
+    display: flex;
+    font-size: 10.5pt;
+}
+#msg div:hover {
+	background-color: #5e5e63;
+}
+canvas {
+	border: #000 1px solid;
+}
+textarea {
+	padding: 4px;
+	background-color: #65656b;
+	color: #cbcbce;
+	font-size: 10.5pt
+}
+button, input[type="button"] {
+	padding: 3px 24px;
+}
