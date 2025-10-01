@@ -31,69 +31,51 @@ const font_name_ids = [
 class CFFIndex {
 	count: number
 	buf: Uint8Array
-	start_of_index: number
-	offset_size: number
-	data_offset: number
 	after_offset: number
+	item_offset: ((index:number)=>number)
 	constructor(buf: Uint8Array, offset_to_index: number) {
-		this.buf = buf
-		this.count = buf[offset_to_index] * 0x100 + buf[offset_to_index+1]
+		this.count = buf[offset_to_index] * 256 + buf[offset_to_index+1]
 		if(this.count < 1) {
-			this.offset_size = 0
 			this.after_offset = offset_to_index + 2
-			this.data_offset = offset_to_index + 1
-			this.start_of_index = offset_to_index + 2
+			this.item_offset = () => {throw new Error()}
 			return
 		}
-		this.offset_size = buf[offset_to_index+2]
-		this.start_of_index = offset_to_index+3
-		this.data_offset = offset_to_index+3+((this.count+1) * this.offset_size)-1
-		this.after_offset = this.item_offset(this.count)
+		const offset_size = buf[offset_to_index+2]
+		const start_of_index = offset_to_index+3
+		if(offset_size === 1) {
+			this.item_offset = (index) => buf[start_of_index + index] - 1
+		} else if(offset_size === 2) {
+			this.item_offset = (index) => {
+				let offset = start_of_index + index * 2
+				return buf[offset]*256 + buf[offset+1] - 1
+			}
+		} else if(offset_size === 3) {
+			this.item_offset = (index) => {
+				let offset = start_of_index + index * 3
+				return ((buf[offset]<<16) | (buf[offset+1]<<8) | buf[offset+2]) - 1
+			}
+		} else if(offset_size === 4) {
+			this.item_offset = (index) => {
+				let offset = start_of_index + index * 4
+				return (buf[offset]*16777216) + ((buf[offset+1]<<16) |
+					(buf[offset+2]<<8) | buf[offset+3]) - 1
+			}
+		} else {
+			throw new Error(`CFF INDEX with offset size ${offset_size}, loaded offset=${offset_to_index}+${buf.byteOffset} count=${this.count}`)
+		}
+		let data_offset = offset_to_index+3+((this.count+1) * offset_size)
+		this.after_offset = this.item_offset(this.count) + data_offset
+		this.buf = buf.subarray(data_offset, this.after_offset)
 	}
-	item_offset(index:number):number {
-		let offset = this.start_of_index + index * this.offset_size
-		let value_offset = this.buf[offset]
-		if(this.offset_size > 1) {
-			value_offset = value_offset * 0x100 + this.buf[offset+1]
-		}
-		if(this.offset_size > 2) {
-			value_offset = value_offset * 0x100 + this.buf[offset+2]
-		}
-		if(this.offset_size > 3) {
-			value_offset = value_offset * 0x100 + this.buf[offset+3]
-		}
-		return value_offset + this.data_offset
-	}
-	forEach(f: (off: number, index: number, len: number) => void) {
-		let last_offset = 0
-		for(let value_index = 0; value_index <= this.count; value_index++) {
+	forEach(f: (buf: Uint8Array, off: number, index: number, len: number) => void) {
+		let last_offset = this.item_offset(0)
+		for(let value_index = 1; value_index <= this.count; value_index++) {
 			let value_offset = this.item_offset(value_index)
 			let value_length = value_offset - last_offset
-			if(value_index > 0) {
-				f(last_offset, value_index - 1, value_length)
-			}
+			f(this.buf, last_offset, value_index - 1, value_length)
 			last_offset = value_offset
 		}
 	}
-}
-
-function read_index(
-	buf: Uint8Array, the_offset_thing: number,
-	init: (count: number) => void,
-	f: (off: number, index: number, len: number) => void
-):CFFIndex {
-	let index_obj = new CFFIndex(buf, the_offset_thing)
-	init(index_obj.count)
-	let last_offset = 0
-	for(let value_index = 0; value_index <= index_obj.count; value_index++) {
-		let value_offset = index_obj.item_offset(value_index)
-		let value_length = value_offset - last_offset
-		if(value_index > 0) {
-			f(index_obj.data_offset + last_offset, value_index - 1, value_length)
-		}
-		last_offset = value_offset
-	}
-	return index_obj
 }
 
 interface FontTable {
@@ -180,11 +162,11 @@ function parse_cff1(table: FontTable, cff_buf: Uint8Array) {
 	console.log(`CFF v${major}.${minor},`, header_size, offsets_size)
 	let cff_name_index = new CFFIndex(cff_buf, header_size)
 	console.log('CFF names', cff_name_index.count)
-	cff_name_index.forEach((offset, index, length) => {
+	cff_name_index.forEach((buf, offset, index, length) => {
 		let s = ''
 		let the_value: number
 		let maybe_length = 0
-		while(maybe_length < length && (the_value = cff_buf[offset++]) > 0) {
+		while(maybe_length < length && (the_value = buf[offset++]) > 0) {
 			maybe_length++
 			if(the_value < 32) {
 				s += `\\${the_value.toString(8).padStart(3,'0')}`
@@ -239,7 +221,7 @@ function parse_cff1(table: FontTable, cff_buf: Uint8Array) {
 			let offset = cff_strings_index.item_offset(sid)
 			let end = cff_strings_index.item_offset(sid+1)
 			let c: number, s:string = ''
-			while(offset < end && (c = cff_buf[offset++]) > 0) {
+			while(offset < end && (c = cff_strings_index.buf[offset++]) > 0) {
 				s += String.fromCodePoint(c)
 			}
 			return s
@@ -258,13 +240,14 @@ function parse_cff1(table: FontTable, cff_buf: Uint8Array) {
 	//   delta is ***fun***, just difference between number and hte last
 	enum DictKind {
 		string = 0,
-		number = 1,
-		bool = 2,
-		SID = 3,
-		INDEX = 4,
-		DICT = 5,
-		ARRAY = 6,
-		Delta = 7,
+		number,
+		bool,
+		SID,
+		INDEX,
+		ABS_INDEX, // relative to CFF start
+		DICT,
+		ARRAY,
+		Delta,
 	}
 	type DICT_ENTRY =
 		[string, DictKind] |
@@ -274,9 +257,26 @@ function parse_cff1(table: FontTable, cff_buf: Uint8Array) {
 		((context: any, args: any[], offset:number)=>void);
 	type DICT_DEF = {[i:string]: DICT_ENTRY|undefined }
 	let private_dict_entries: DICT_DEF = {
+		6: ['blues', DictKind.Delta],
+		7: ['other_blues', DictKind.Delta],
+		8: ['family_blues', DictKind.Delta],
+		9: ['family_other_blues', DictKind.Delta],
+		10: ['std_hw', DictKind.number],
+		11: ['std_vw', DictKind.number],
 		19: (context: any, args: any[], offset:number) => { // Subrs offset from start of private dict
-			context.private = new CFFIndex(cff_buf, offset + args[0])
+			context.subrs = new CFFIndex(cff_buf, offset + args[0])
 		},
+		20: ['default_width_x', DictKind.number, 0],
+		21: ['nominal_width_x', DictKind.number, 0],
+		_9: ['blue_scale', DictKind.number, 0.039625], // mystery goo number (very important, probably)
+		_10: ['blue_shift', DictKind.number, 7], // for lightspeed travel only
+		_11: ['blue_fuzz', DictKind.number, 1], // somewhat fuzzy
+		_12: ['stem_snap_h', DictKind.Delta],
+		_13: ['stem_snap_v', DictKind.Delta],
+		_14: ['force_bold', DictKind.bool, false],
+		_17: ['language_group', DictKind.number, 0],
+		_18: ['expansion_factor', DictKind.number, 0.06],
+		_19: ['initial_random_seed', DictKind.number, 0],
 	}
 	let top_dict_entries: DICT_DEF
 	top_dict_entries = {
@@ -293,7 +293,7 @@ function parse_cff1(table: FontTable, cff_buf: Uint8Array) {
 			context.charset_format = cff_buf[context.charset_off]
 		},
 		16: ['encoding_off', DictKind.number, 0], // encoding offset from start of CFF
-		17: ['charstrings', DictKind.INDEX], // charstrings offset from start of CFF
+		17: ['charstrings', DictKind.ABS_INDEX], // charstrings offset from start of CFF
 		18: ['private', DictKind.DICT, private_dict_entries], // private DICT size and the offset from start of CFF
 		_0: ['copyright', DictKind.SID],
 		_1: ['is_fixed_pitch', DictKind.bool, false],
@@ -331,8 +331,8 @@ function parse_cff1(table: FontTable, cff_buf: Uint8Array) {
 			let the_index = new CFFIndex(cff_buf, args[0])
 			context.fd_array = []
 			the_index.forEach(
-			function(offset:number, index:number, length:number) {
-				let font_dict = load_dict(offset, length, top_dict_entries)
+			function(buf, offset:number, index:number, length:number) {
+				let font_dict = load_dict(buf, offset, length, top_dict_entries)
 				context.fd_array.push(font_dict)
 			})
 		},
@@ -342,26 +342,27 @@ function parse_cff1(table: FontTable, cff_buf: Uint8Array) {
 		},
 		_38: ['cid_fontname', DictKind.SID],
 	}
-	function load_dict(offset:number, length:number, entries: DICT_DEF) {
+	function load_dict(buf: Uint8Array, offset:number, length:number, entries: DICT_DEF) {
 		let maybe_dict: CFFTopDict = { } as CFFTopDict
 		let meh:any[] = []
 		let start_offset = offset
 		let end = offset + length
 		//  Top DICT operators:
 		while(offset < end) {
-			let v = cff_buf[offset++]
+			let v = buf[offset++]
 			if(v >= 27 && v < 28) {
 				// 22..27 => very reserved, no touch
 				meh.push(`evil`)
 			} else if(v == 28) {
 				// 28 => -32768 .. +32767  i16: (the_bytes[1] * 0x100) + the_bytes[2]
 				if(offset+1 >= end) break
-				meh.push(u16(offset))
+				meh.push((buf[offset]<<8) | buf[offset+1])
 				offset += 2
 			} else if(v == 29) {
 				// 29 => +-2 bajillion     i32: (the_bytes[1] * 0x1000000) + (the_bytes[2] * 0x10000) + (the_bytes[3] * 0x100) + (the_bytes[4])
 				if(offset+3 >= end) break
-				meh.push(u32(offset))
+				meh.push(buf[offset] * (1<<24) + (
+					(buf[offset+1]<<16) | (buf[offset+2]<<8) | buf[offset+3]))
 				offset += 4
 			} else if(v == 30) {
 				// 30 => real numbers, totally not fake
@@ -376,22 +377,29 @@ function parse_cff1(table: FontTable, cff_buf: Uint8Array) {
 				//    f    => end of the number,
 				//            use ff iff you need to end on nibble 0,
 				//            so the byte is nice and ffull
-				let fake_number = ''
+				let fake_number = 0
+				let fake_exp = 1
+				let fake_bias = 0
+				let fake_esign = 1
+				let fake_sign = 1
+				let dec = 0
 				while(offset < end) {
-					let v1 = cff_buf[offset++]
+					let v1 = buf[offset++]
 					function do_num(n:number) {
 						if(n < 10) {
-							fake_number += `${n}`
-						} else if(n == 10) {
-							fake_number += '.'
-						} else if(n == 0xb) {
-							fake_number += 'E'
+							if(dec==2) {
+								fake_bias = fake_bias * 10 + n
+							} else {
+								fake_number = fake_number * 10 + n
+							}
+							if(dec==1) { fake_exp-- }
+						} else if(n == 0xa) { dec = 1
+						} else if(n == 0xb) { dec = 2
 						} else if(n == 0xc) {
-							fake_number += 'E-'
+							dec = 2
+							fake_esign = -1;
 						} else if(n == 0xd) {
-							fake_number += '?'
-						} else if(n == 0xe) {
-							fake_number += '-'
+						} else if(n == 0xe) { fake_sign = -1
 						} else if(v1 == 0xff || n == 0xf) {
 							return true
 						}
@@ -400,25 +408,38 @@ function parse_cff1(table: FontTable, cff_buf: Uint8Array) {
 					if(do_num(v1 >> 4)) { break }
 					if(do_num(v1 & 15)) { break }
 				}
-				meh.push(fake_number)
+				fake_exp += fake_esign * fake_bias
+				let meh_number = fake_number
+				let meh_exp = fake_exp
+				let meh_div = 1
+				while(fake_exp >  10) { meh_div *= 1e+10; fake_exp -= 10 }
+				while(fake_exp-- > 0) { meh_div *= 10 }
+				while(fake_exp < -10) { meh_div *= 1e+10; fake_exp += 10 }
+				while(fake_exp++ < 0) { meh_div *= 10 }
+				if(meh_exp < 0) {
+					fake_number = fake_number / meh_div
+				} else {
+					fake_number = fake_number * meh_div
+				}
+				meh.push(fake_number * fake_sign)
 			} else if(v >= 32 && v <= 246) {
 				//  32..246 =>   -107 ..   +107  (the_bytes[0] - 139)
 				meh.push(v - 139)
 			} else if(v >= 247 && v <= 250) {
 				// 247..250 =>   +108 ..  +1131  (the_bytes[0] - 247) * 0x100 + the_bytes[1] + 108
 				if(offset >= end) break
-				let v1 = cff_buf[offset++]
+				let v1 = buf[offset++]
 				meh.push((v - 247) * 256 + v1 + 108)
 			} else if(v >= 251 && v <= 254) {
 				// 251..254 =>  -1131 ..   -108 -(the_bytes[0] - 251) * 0x100 - the_bytes[1] - 108
 				if(offset >= end) break
-				let v1 = cff_buf[offset++]
+				let v1 = buf[offset++]
 				meh.push((v - 251) * -256 - v1 - 108)
 			} else {
 				let key: string
 				if(v == 12) {
 					if(offset >= end) break
-					let v1 = cff_buf[offset++]
+					let v1 = buf[offset++]
 					key = `_${v1}`
 				} else {
 					key = `${v}`
@@ -430,13 +451,15 @@ function parse_cff1(table: FontTable, cff_buf: Uint8Array) {
 					} else {
 						let [prop, kind, len_or_default, array_default] = maybe_entry;
 						if(kind === DictKind.INDEX) {
+							maybe_dict[prop] = new CFFIndex(buf, meh[0])
+						} else if(kind === DictKind.ABS_INDEX) {
 							maybe_dict[prop] = new CFFIndex(cff_buf, meh[0])
 						} else if(kind === DictKind.SID) {
 							maybe_dict[prop] = sid_lookup(meh[0])
 						} else if(kind < DictKind.DICT) {
 							maybe_dict[prop] = meh[0]
 						} else if(kind === DictKind.DICT) {
-							maybe_dict[prop] = load_dict(meh[1], meh[0], len_or_default ?? {})
+							maybe_dict[prop] = load_dict(cff_buf, meh[1], meh[0], len_or_default ?? {})
 						} else {
 							maybe_dict[prop] = meh
 						}
@@ -447,41 +470,45 @@ function parse_cff1(table: FontTable, cff_buf: Uint8Array) {
 				meh = []
 			}
 		}
-		console.log('CFF Top dict values:', meh, maybe_dict)
+		console.log('DICT:', maybe_dict)
 		return maybe_dict
 	}
 	let last_top_dict: CFFTopDict = {} as CFFTopDict
-	cff_top_dict_index.forEach(function(offset:number, index:number, length:number) {
+	cff_top_dict_index.forEach(function(buf, offset:number, index:number, length:number) {
 		console.log('CFF Top DICT #', index, 'len=', length)
-		last_top_dict = load_dict(offset, length, top_dict_entries)
+		last_top_dict = load_dict(buf, offset, length, top_dict_entries)
 	})
 	let number_of_charstrings_we_wasted_time_on = 0
 	if(last_top_dict.charstrings != undefined) {
 		console.log('CFF CharStrings count', last_top_dict.charstrings.count)
-		last_top_dict.charstrings.forEach((offset, index, length) => {
+		last_top_dict.charstrings.forEach((buf, offset, index, length) => {
 			//if(index > 120) return;
 			let meh:any[] = []
 			let end = offset + length
 			for(; offset < end; ) {
-				let v = cff_buf[offset++]
+				let v = buf[offset++]
 				if(v == 0) {
 					meh.push('EVIL')
 				} else if(v == 12) {
 					if(offset >= end) break
-					let v1 = cff_buf[offset++]
+					let v1 = buf[offset++]
 					meh.push(`opx+${v1}`)
 					break
 				} else if(v == 28) {
 					// 28 => -32768 .. +32767  i16
 					//meh.push(`n${v}`)
 					if(offset+1 >= end) break
-					meh.push(u16(offset))
+					meh.push(buf[offset] * 0x100 + buf[offset+1])
 					offset += 2
 				} else if(v == 255) {
 					//meh.push(`n${v}`)
 					// 255 => +-2 bajillion -> fixed i16.16
 					if(offset+3 >= end) break
-					meh.push(u32(offset) * 0.0000152587890625)
+					meh.push(
+						(buf[offset] * 0x1000000
+						+ (buf[offset+1]<<16)
+						+ (buf[offset+2]<<8)
+						+ buf[offset+3]) * 0.0000152587890625)
 					offset += 4
 				} else if(v >= 32 && v <= 246) {
 					//meh.push(`n${v}`)
@@ -491,13 +518,13 @@ function parse_cff1(table: FontTable, cff_buf: Uint8Array) {
 					//meh.push(`n${v}`)
 					// 247..250 =>   +108 ..  +1131  (the_bytes[0] - 247) * 0x100 + the_bytes[1] + 108
 					if(offset >= end) break
-					let v1 = cff_buf[offset++]
+					let v1 = buf[offset++]
 					meh.push((v - 247) * 256 + v1 + 108)
 				} else if(v >= 251 && v <= 254) {
 					//meh.push(`n${v}`)
 					// 251..254 =>  -1131 ..   -108 -(the_bytes[0] - 251) * 0x100 - the_bytes[1] - 108
 					if(offset >= end) break
-					let v1 = cff_buf[offset++]
+					let v1 = buf[offset++]
 					meh.push((v - 251) * -256 - v1 - 108)
 				} else {switch(v) {
 					case 1: meh.push('hstem'); break
