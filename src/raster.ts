@@ -42,8 +42,17 @@ export enum ShapePointKind {
 export class ShapePoint extends Point {
 	control: Point|undefined
 	curve_type = ShapePointKind.Line
+	tag: string = ''
 	constructor(x?: number, y?: number) {
 		super(x,y)
+	}
+	set_control(x: number, y: number) {
+		if(!this.control) {
+			this.control = new Point(x - this.x, y - this.y)
+		} else {
+			this.control.x = x - this.x
+			this.control.y = y - this.y
+		}
 	}
 }
 
@@ -716,7 +725,8 @@ export class TheRasterThing {
 		const c1 = 0xffffffff
 		const c2 = 0xff000000
 		const c3 = 0x88000000
-		const ceek = 0x88ff0000
+		//const ceek = 0x88ff0000
+		const ceek = 0x88ffa040
 		const debug_points = this.debug_points;
 		debug_points.length = 0
 		this.debug_boxes.length = 0
@@ -885,8 +895,9 @@ export class TheRasterThing {
 					curve.intercept(e, inter)
 					if(inter.x !== undefined) {
 						if(isNaN(inter.x)) {
-							debugger
+							//debugger
 							curve.intercept(e, inter)
+							inter.x = curve.box_max_x
 						}
 						if(inter.x > curve.box_max_x) {
 							console.log(`overrun x scanline at row ${e}, curve segment ${i}`)
@@ -912,11 +923,13 @@ export class TheRasterThing {
 				}
 				if(!current_inter) break
 				if(n > 0) {
-					pixels[row + x] = ceek
-				} else if(n === 0) {
-					pixels[row + x] = c1
-				} else {
+					//pixels[row + x] = ceek
 					pixels[row + x] = c0
+				} else if(n === 0) {
+					pixels[row + x] = c0
+				} else {
+					//pixels[row + x] = c0
+					pixels[row + x] = ceek
 				}
 			}
 			for(; x < width; x++) {
@@ -975,6 +988,7 @@ export class TheRasterThing {
 		ctx.strokeStyle = '#ff88ff'
 		ctx.strokeRect(this.test_x - 4, this.test_y - 4, 8, 8)
 		ctx.beginPath()
+		ctx.fillStyle = '#ffffff'
 		for(let outline_index = 0; outline_index < this.outlines.length; outline_index++) {
 			let outline = this.outlines[outline_index]
 			let last: Point|undefined
@@ -993,6 +1007,7 @@ export class TheRasterThing {
 				}
 				if(activated) {
 					ctx.strokeRect(point.x - 10, point.y - 10, 20, 20)
+					ctx.fillText(`${i}-${point.tag}`, point.x, point.y)
 				}
 				if(last) {
 					ctx.lineTo(point.x, point.y)
@@ -1142,10 +1157,20 @@ export class TheRasterThing {
 		}
 		this.redraw_points()
 	}
-	secondary_down(x: number, y: number) {
+	add_point(x: number, y: number, tag?: string): ShapePoint {
 		let outline = this.active_outline
+		let p = new ShapePoint(x,y)
 		if(outline) {
-			outline.points.push(new ShapePoint(x,y))
+			if(tag != undefined) {
+				p.tag = tag
+			}
+			outline.points.push(p)
+		}
+		return p
+	}
+	secondary_down(x: number, y: number) {
+		this.add_point(x, y)
+		if(this.active_outline) {
 			this.save_points()
 			this.rasterize();
 		}

@@ -1,4 +1,7 @@
 
+import * as raster from './raster'
+import {ShapePointKind, lerp} from './raster'
+
 const font_name_ids = [
 	/* 0 */'copyright',
 	/* 1 */'family',
@@ -247,9 +250,9 @@ function parse_tt_head(table: FontTable, buf: Uint8Array) {
 	if(flags & 8192) font_flags.font_might_look_okay_if_blury = true
 	if(flags & 16384) font_flags.this_is_not_the_font_you_are_looking_for = true
 	if(flags & 32768) font_flags.font_is_made_of_pure_evil_and_should_be_excised = true
-	console.log('flags', font_flags)
-	console.log('c', created.toUTCString(), 'm', modifed.toUTCString())
-	console.log('bounds', min_x, min_y, '-', max_x, max_y)
+	console.log('flags', String(Object.keys(font_flags)))
+	//console.log('c', created.toUTCString(), 'm', modifed.toUTCString())
+	//console.log('bounds', min_x, min_y, '-', max_x, max_y)
 }
 
 function parse_tt_name(table: FontTable, buf: Uint8Array) {
@@ -309,7 +312,11 @@ function parse_cmap(table: FontTable & {cmap:any}, buf: Uint8Array) {
 	let u32 = (offset: number) => (buf[offset]*0x1000000) + (buf[offset+1]<<16) + (buf[offset+2]<<8) + buf[offset+3]
 	let version = u16(0)
 	let count = u16(2)
-	console.log(`'cmap' table version`, version, 'with', count, 'entries')
+	//console.log(`'cmap' table version`, version, 'with', count, 'entries')
+	if(version !== 0) {
+		console.error(EEK, `cmap of highly sus version`, version, 'and count', count)
+		throw new EEKError('cmap is stinky')
+	}
 	let cmaps:any = {}
 	table.cmap = cmaps
 	let oadd = (v:number) => { v = (v < 0) ? (v + 65536) : v; return v > 65535 ? v - 65536 : v }
@@ -372,7 +379,7 @@ function parse_cmap(table: FontTable & {cmap:any}, buf: Uint8Array) {
 					//console.log('segment', hex(start), hex(end), 'n', l, gro - off_id_array)
 				}
 			}
-			console.log('cmap', encoding_id, 'glyph count:', glyph_count)
+			//console.log('cmap', encoding_id, 'glyph count:', glyph_count)
 		} else if(st_format == 12) {
 			let st_length = u32(offset + 4)
 			let st_lang = u32(offset + 8)
@@ -394,15 +401,15 @@ function parse_cmap(table: FontTable & {cmap:any}, buf: Uint8Array) {
 				}
 				glyph_count += l
 			}
-			console.log('cmap', encoding_id, 'glyph count:', glyph_count_bmp, glyph_count)
+			//console.log('cmap', encoding_id, 'glyph count:', glyph_count_bmp, glyph_count)
 		} else {
-			console.log(`cmap ${platform}/${encoding_id} @`, offset, 'format:', st_format)
+			console.log(`unprocessed cmap ${platform}/${encoding_id} @`, offset, 'format:', st_format)
 		}
 	}
 	//console.log('cmap', table)
 }
 
-function parse_cff1(table: FontTable, cff_buf: Uint8Array) {
+function parse_cff1(table: FontTable, cff_buf: Uint8Array, raster?: raster.TheRasterThing) {
 	function u32(offset: number) {
 		return cff_buf[offset] * 0x1000000 + cff_buf[offset+1] * 0x10000 + cff_buf[offset+2] * 0x100 + cff_buf[offset+3]
 	}
@@ -443,6 +450,7 @@ function parse_cff1(table: FontTable, cff_buf: Uint8Array) {
 		uid_base?: number,
 		fd_array?: any[],
 		fd_select_off?: number,
+		fd_select?: { first:number, fd: any, end:number }[],
 		ros?: {
 			registry: string,
 			ordering: string,
@@ -594,10 +602,7 @@ function parse_cff1(table: FontTable, cff_buf: Uint8Array) {
 				context.fd_array.push(font_dict)
 			})
 		},
-		_37: (context: any, args: any[]) => { // 12,37 FDSelect(num)
-			context.fd_select_off = args[0]
-			context.fd_select_format = cff_buf[context.fd_select_off]
-		},
+		_37: ['fd_select_off', DictKind.number], // 12,37 FDSelect(num)
 		_38: ['cid_fontname', DictKind.SID],
 	}
 	function load_dict(buf: Uint8Array, offset:number, length:number, entries: DICT_DEF) {
@@ -611,6 +616,7 @@ function parse_cff1(table: FontTable, cff_buf: Uint8Array) {
 			if(v >= 27 && v < 28) {
 				// 22..27 => very reserved, no touch
 				meh.push(`evil`)
+				throw new EEKError(`the Top DICT is full of evil`)
 			} else if(v == 28) {
 				// 28 => -32768 .. +32767  i16: (the_bytes[1] * 0x100) + the_bytes[2]
 				if(offset+1 >= end) break
@@ -734,87 +740,611 @@ function parse_cff1(table: FontTable, cff_buf: Uint8Array) {
 	let last_top_dict: CFFTopDict = {} as CFFTopDict
 	cff_top_dict_index.forEach(function(buf, offset:number, index:number, length:number) {
 		last_top_dict = load_dict(buf, offset, length, top_dict_entries)
+		if(last_top_dict.ros && (last_top_dict.fd_select_off != undefined) && last_top_dict.fd_array) {
+			let fd_array = last_top_dict.fd_array
+			let offset = last_top_dict.fd_select_off
+			let fd_format = cff_buf[last_top_dict.fd_select_off]
+			if(fd_format == 0) {
+				throw new EEKError(`the CFFTopDICTCIDFDSelect uses format 0, but meisaka didn't implement that one yet`)
+			} else if(fd_format == 3) {
+				let count = u16(offset + 1)
+				let ranges:{first:number, fd:any, end:number}[] = []
+				let last: {first:number, fd:any, end:number}|undefined
+				for(let i = 0; i < count; i++) {
+					let o = offset + 3 + i * 3
+					let first = u16(o)
+					if(last) {
+						last.end = first - 1
+					}
+					let obj = { first, end:first, fd: fd_array[cff_buf[o+2]] }
+					last = obj
+					ranges.push(obj)
+				}
+				if(last) {
+					last.end = u16(offset+3+count*3) - 1
+				}
+				for(let i of ranges) {
+					console.log('range:', i)
+				}
+				last_top_dict.fd_select = ranges
+			} else {
+				throw new EEKError(`the CFFTopDICTCIDFDSelect thingy is cursed format=${fd_format}`)
+			}
+		}
 		console.log('CFF Top DICT #', index, 'len=', length, last_top_dict)
 	})
 	let number_of_charstrings_we_wasted_time_on = 0
 	if(last_top_dict.charstrings != undefined) {
 		console.log('CFF CharStrings count', last_top_dict.charstrings.count)
+		let did_draw_one = false
+		let fd_select_index = 0
+		let fd_select = last_top_dict.fd_select || []
 		last_top_dict.charstrings.forEach((buf, offset, index, length) => {
-			//if(index > 120) return;
+			while(fd_select_index < fd_select.length
+				&& index < fd_select[fd_select_index].first) {
+				fd_select_index++
+			}
+			if(did_draw_one) return;
+			if(index <= 5) return;
 			let meh:any[] = []
+			let cmd:any[] = []
 			let end = offset + length
+			let width = 0
+			let SCALE = 0.825
+			let XOFF = 200
+			let YOFF = 700
+			let hstems:any[] = []
+			let vstems:any[] = []
+			let num_of_mask_bytes = 0
+			let have_hstem = false
+			let have_vstem = false
+			let need_outline = true
+			let current_x = 0, current_y = 0
+			let move_x = 0, move_y = 0, moved = true
+			let last_point: raster.ShapePoint | undefined
+			let line_to = (x: number, y: number, tag?: string) => {
+				if(raster) {
+					if(moved) {
+						raster.add_outline()
+						raster.add_point(XOFF+SCALE*move_x, YOFF-SCALE*move_y, 'move')
+						moved = false
+					}
+					last_point = raster.add_point(XOFF+SCALE*x, YOFF-SCALE*y, tag)
+				}
+			}
+			let make_the_last_point_into_curve_thing = (x: number, y: number) => {
+				if(!raster) {
+					return
+				}
+				if(!last_point) {
+					if(moved) {
+						raster.add_outline()
+						last_point = raster.add_point(XOFF+SCALE*move_x, YOFF-SCALE*move_y, 'move')
+						moved = false
+					} else {
+						return
+					}
+				}
+				if(!last_point.control) {
+					last_point.set_control(XOFF+SCALE*x, YOFF-SCALE*y)
+					last_point.curve_type = ShapePointKind.Quadradic
+				}
+			}
+			let eat_the_implicit_vstem_values_pls = () => {
+				for(let i = 0; i < meh.length; i+= 2) {
+					vstems.push({vs:meh[i], ve:meh[i+1]})
+				}
+				num_of_mask_bytes = hstems.length + vstems.length
+				if((num_of_mask_bytes & 7) != 0) {
+					num_of_mask_bytes += 8
+				}
+				cmd.push(['vstems', ...vstems])
+				num_of_mask_bytes = num_of_mask_bytes >> 3
+				have_vstem = true
+				meh.length = 0
+			}
 			for(; offset < end; ) {
 				let v = buf[offset++]
 				if(v == 0) {
 					meh.push('EVIL')
+					console.error(`the CFF CharString ${index} @ ${offset} is full of pure EVIL, and must be purged`)
+					//throw new EEKError(`the CFF CharStrings are full of pure EVIL, and must be purged`)
 				} else if(v == 12) {
 					if(offset >= end) break
 					let v1 = buf[offset++]
-					meh.push(`opx+${v1}`)
+					cmd.push([`opx12_${v1}`, ...meh])
+					meh.length = 0
 					break
 				} else if(v == 28) {
 					// 28 => -32768 .. +32767  i16
-					//meh.push(`n${v}`)
 					if(offset+1 >= end) break
 					meh.push(buf[offset] * 0x100 + buf[offset+1])
 					offset += 2
 				} else if(v == 255) {
-					//meh.push(`n${v}`)
 					// 255 => +-2 bajillion -> fixed i16.16
 					if(offset+3 >= end) break
 					meh.push(
 						(buf[offset] * 0x1000000
 						+ (buf[offset+1]<<16)
 						+ (buf[offset+2]<<8)
-						+ buf[offset+3]) * 0.0000152587890625)
+						+ buf[offset+3]) * 0.0000152587890625
+					)
 					offset += 4
 				} else if(v >= 32 && v <= 246) {
-					//meh.push(`n${v}`)
 					//  32..246 =>   -107 ..   +107  (the_bytes[0] - 139)
 					meh.push(v - 139)
 				} else if(v >= 247 && v <= 250) {
-					//meh.push(`n${v}`)
 					// 247..250 =>   +108 ..  +1131  (the_bytes[0] - 247) * 0x100 + the_bytes[1] + 108
 					if(offset >= end) break
 					let v1 = buf[offset++]
 					meh.push((v - 247) * 256 + v1 + 108)
 				} else if(v >= 251 && v <= 254) {
-					//meh.push(`n${v}`)
 					// 251..254 =>  -1131 ..   -108 -(the_bytes[0] - 251) * 0x100 - the_bytes[1] - 108
 					if(offset >= end) break
 					let v1 = buf[offset++]
 					meh.push((v - 251) * -256 - v1 - 108)
 				} else {switch(v) {
-					case 1: meh.push('hstem'); break
-					case 3: meh.push('vstem'); break
-					case 4: meh.push('vmoveto'); break
-					case 5: meh.push('rlineto'); break
-					case 6: meh.push('hlineto'); break
-					case 7: meh.push('vlineto'); break
-					case 8: meh.push('rrcurveto'); break
+					case 1:
+						if((meh.length & 1) != 0) {
+							width = meh.shift() as number
+						}
+						for(let i = 0; i < meh.length; i+= 2) {
+							hstems.push({hs:meh[i], he:meh[i+1]})
+						}
+						num_of_mask_bytes = hstems.length + vstems.length
+						if((num_of_mask_bytes & 7) != 0) {
+							num_of_mask_bytes += 8
+						}
+						num_of_mask_bytes = num_of_mask_bytes >> 3
+						meh.length = 0
+						cmd.push(['hstem', ...hstems])
+						have_hstem = true
+					break
+					case 3:
+						eat_the_implicit_vstem_values_pls()
+					break
+					case 4:
+						current_y += meh[0]
+						cmd.push(['*vmoveto', ...meh])
+						meh.length = 0
+						move_x = current_x
+						move_y = current_y
+						moved = true
+						have_hstem = true
+						have_vstem = true
+					break
+					case 5:
+						cmd.push(['*rlineto', ...meh])
+						while(meh.length > 1) {
+							let dx = meh.shift() as number
+							let dy = meh.shift() as number
+							current_x += dx
+							current_y += dy
+							line_to(current_x, current_y, 'rl')
+						}
+						meh.length = 0
+					break
+					case 6:
+						cmd.push(['*hlineto', ...meh])
+						if((meh.length & 1) != 0) {
+							let dx = meh.shift() as number
+							current_x += dx
+							line_to(current_x, current_y, 'hl')
+							while(meh.length > 0) {
+								let dya = meh.shift() as number
+								let dxb = meh.shift() as number
+								current_y += dya
+								line_to(current_x, current_y, 'hl')
+								current_x += dxb
+								line_to(current_x, current_y, 'hl')
+							}
+						} else {
+							while(meh.length > 0) {
+								let dxa = meh.shift() as number
+								let dyb = meh.shift() as number
+								current_x += dxa
+								line_to(current_x, current_y, 'hl')
+								current_y += dyb
+								line_to(current_x, current_y, 'hl')
+							}
+						}
+						meh.length = 0
+					break
+					case 7:
+						cmd.push(['*vlineto', ...meh])
+						if((meh.length & 1) != 0) {
+							let dy1 = meh.shift() as number
+							current_y += dy1
+							line_to(current_x, current_y, 'vl')
+							while(meh.length > 0) {
+								let dxa = meh.shift() as number
+								let dyb = meh.shift() as number
+								current_x += dxa
+								line_to(current_x, current_y, 'vl')
+								current_y += dyb
+								line_to(current_x, current_y, 'vl')
+							}
+						} else {
+							while(meh.length > 0) {
+								let dya = meh.shift() as number
+								let dxb = meh.shift() as number
+								current_y += dya
+								line_to(current_x, current_y, 'vl')
+								current_x += dxb
+								line_to(current_x, current_y, 'vl')
+							}
+						}
+						meh.length = 0
+					break
+					case 8: {
+						cmd.push(['*rrcurveto', ...meh])
+						let o = 0
+						for(; (o+5) < meh.length; o+= 6) {
+							let s_x = current_x, s_y = current_y
+							current_x += meh[o]
+							current_y += meh[o+1]
+							let c1_x = current_x, c1_y = current_y
+							current_x += meh[o+2]
+							current_y += meh[o+3]
+							let c2_x = current_x, c2_y = current_y
+							current_x += meh[o+4]
+							current_y += meh[o+5]
+							let e_x = current_x, e_y = current_y
+							line_to(c1_x, c1_y, 'rrc1')
+							line_to(c2_x, c2_y, 'rrc2')
+							line_to(e_x, e_y, 'rrc3')
+						}
+						meh.length = 0
+					} break
 					case 10:
-						meh.push('callsubr');
+						cmd.push(['10callsubr', ...meh])
+						meh.length = 0
+						if(!have_hstem || !have_vstem) {
+							console.warn('callsubr without stems defined')
+						}
+						return
 						//console.warn('callsubr without a local subroutine table')
 					break
-					case 11: meh.push('return'); break
-					case 18: meh.push('hstemhm'); break
-					case 19: meh.push('hintmask'); break
-					case 20: meh.push('cntrmask'); break
-					case 21: meh.push('rmoveto'); break
-					case 22: meh.push('hmoveto'); break
-					case 23: meh.push('vstemhm'); break
-					case 24: meh.push('rcurveline'); break
-					case 25: meh.push('rlinecurve'); break
-					case 26: meh.push('vvcurveto'); break
-					case 27: meh.push('hhcurveto'); break
-					case 29: meh.push('callgsubr'); break
-					case 30: meh.push('vhcurveto'); break
-					case 31: meh.push('hvcurveto'); break
-					case 14: meh.push(`endchar`); break
-					default: meh.push(`op${v}`)
+					case 11:
+						cmd.push(['11return', ...meh])
+						meh.length = 0
+					break
+					case 18:
+						if(!have_hstem) {
+							if((meh.length & 1) != 0) {
+								width = meh.shift() as number
+							}
+							for(let i = 0; i < meh.length; i+= 2) {
+								hstems.push({hs:meh[i], he:meh[i+1]})
+							}
+							num_of_mask_bytes = hstems.length + vstems.length
+							if((num_of_mask_bytes & 7) != 0) {
+								num_of_mask_bytes += 8
+							}
+							num_of_mask_bytes = num_of_mask_bytes >> 3
+							meh.length = 0
+						}
+						cmd.push(['18hstemhm', ...hstems, ...meh]);
+						meh.length = 0
+						have_hstem = true
+					break
+					case 19: {
+						if(have_hstem && !have_vstem && (meh.length > 0)) {
+							eat_the_implicit_vstem_values_pls()
+						}
+						let mask_bytes = 0
+						let mask = ''
+						while((offset < end) && (mask_bytes < num_of_mask_bytes)) {
+							mask += buf[offset++].toString(2).padStart(8,'0')
+							mask_bytes++
+						}
+						cmd.push(['19hintmask', mask])
+						have_hstem = true
+						have_vstem = true
+					} break
+					case 20: {
+						if(have_hstem && !have_vstem && (meh.length > 0)) {
+							eat_the_implicit_vstem_values_pls()
+						}
+						let mask_bytes = 0
+						let mask = ''
+						while((offset < end) && (mask_bytes < num_of_mask_bytes)) {
+							mask += buf[offset++].toString(2).padStart(8,'0')
+							mask_bytes++
+						}
+						cmd.push(['20cntrmask', mask])
+						have_hstem = true
+						have_vstem = true
+					} break
+					case 21:
+						if(meh.length > 2) {
+							width = meh.shift() as number
+						}
+						current_x += meh[0]
+						current_y += meh[1]
+						cmd.push(['*rmoveto', ...meh])
+						meh.length = 0
+						move_x = current_x
+						move_y = current_y
+						moved = true
+						have_hstem = true
+						have_vstem = true
+					break
+					case 22:
+						current_x += meh[0]
+						move_x = current_x
+						move_y = current_y
+						cmd.push(['*hmoveto', ...meh])
+						meh.length = 0
+						moved = true
+						have_hstem = true
+						have_vstem = true
+					break
+					case 23:
+						eat_the_implicit_vstem_values_pls()
+						cmd.push(['*vstemhm', ...meh])
+						meh.length = 0
+						have_vstem = true
+						have_hstem = true
+					break
+					case 24:
+						cmd.push(['24rcurveline', [...meh]])
+						meh.length = 0
+					break
+					case 25:
+						cmd.push(['25rlinecurve', [...meh]])
+						meh.length = 0
+					break
+					case 26: {
+						cmd.push(['*vvcurveto', ...meh])
+						let s_x = current_x, s_y = current_y
+						if((meh.length & 1) != 0) {
+							current_x += meh.shift() // dx1
+						}
+						let i = 0
+						for(;(i + 3) < meh.length; i+=4) {
+							current_y += meh[i] // dya
+							let c1_x = current_x, c1_y = current_y
+							current_x += meh[i+1] // dxb, dyb
+							current_y += meh[i+2]
+							let c2_x = current_x, c2_y = current_y
+							current_y += meh[i+3] // dyc
+							let e_x = current_x, e_y = current_y
+							line_to(c1_x, c1_y, 'vvc1')
+							line_to(c2_x, c2_y, 'vvc2')
+							line_to(e_x, e_y, 'vvpc')
+						}
+						meh.length = 0
+					} break
+					case 27:
+						cmd.push(['*hhcurveto', ...meh])
+						let dya = 0
+						if((meh.length & 1) != 0) {
+							dya = meh.shift()
+							current_y += dya
+						}
+						let i = 0
+						while((i+3) < meh.length) {
+							let dxa = meh[0+i] // cp start?
+							let dxb = meh[1+i] // target
+							let dyb = meh[2+i]
+							let dxc = meh[3+i] // cp ending
+							current_x += dxa
+							line_to(current_x, current_y, 'hhc1') // cp?
+							current_x += dxb
+							current_y += dyb
+							line_to(current_x, current_y, 'hhc2')
+							current_x += dxc
+							line_to(current_x, current_y, 'hhp')
+							// TODO set the controls
+							i += 4
+						}
+						meh.length = 0
+					break
+					case 29:
+						cmd.push(['29callgsubr', ...meh])
+						meh.length = 0
+						if(!have_hstem || !have_vstem) {
+							console.warn('callsubr without stems defined')
+						}
+						return
+					break
+					case 30:
+						cmd.push(['*vhcurveto', ...meh])
+						if((meh.length & 4) != 0) {
+							let p_x = current_x, p_y = current_y
+							current_y += meh[0] // dy1
+							let c1_x = current_x, c1_y = current_y
+							current_x += meh[1] // dx2, dy2
+							current_y += meh[2]
+							let c2_x = current_x, c2_y = current_y
+							current_x += meh[3] // dx3
+							let s_x = current_x, s_y = current_y
+							line_to(c1_x, c1_y, 'vhc1')
+							line_to(c2_x, c2_y, 'vhc2')
+							let i = 4
+							// |- dy1 dx2 dy2 dx3
+							// {dxa dxb dyb dyc dyd dxe dye dxf}* dyf? 
+							// vhcurveto (30) |-
+							for(;(i+7) < meh.length; i += 8) {
+								line_to(current_x, current_y, 'vhpf')
+								s_x = current_x
+								s_y = current_y
+								current_x += meh[0+i] // dxa
+								let ca_x = current_x, ca_y = current_y
+								current_x += meh[1+i] // dxb dyb
+								current_y += meh[2+i]
+								let cb_x = current_x, cb_y = current_y
+								current_y += meh[3+i] // dyc
+								let pc_x = current_x, pc_y = current_y
+								current_y += meh[4+i] // dyd
+								let cd_x = current_x, cd_y = current_y
+								current_x += meh[5+i] // dxe dye
+								current_y += meh[6+i]
+								let ce_x = current_x, ce_y = current_y
+								current_x += meh[7+i] // dxf
+								line_to(ca_x, ca_y, 'vhca')
+								line_to(cb_x, cb_y, 'vhcb')
+								line_to(pc_x, pc_y, 'vhpc')
+								line_to(cd_x, cd_y, 'vhcd')
+								line_to(ce_x, ce_y, 'vhce')
+							}
+							if(i < meh.length) {
+								current_y += meh[i]
+							}
+							line_to(current_x, current_y, 'vhpf')
+						} else { // length by 8 or 9
+							// {dya dxb dyb dxc dxd dxe dye dyf}+ dxf?
+							let i = 0
+							let has_last = false
+							let s_x = current_x, s_y = current_y
+							for(;(i+7) < meh.length; i += 8) {
+								if(has_last) {
+									line_to(s_x, s_y, 'vhpf')
+								}
+								current_y += meh[i] // dya
+								let c1_x = current_x, c1_y = current_y
+								current_x += meh[i+1] // dxb, dyb
+								current_y += meh[i+2]
+								let c2_x = current_x, c2_y = current_y
+								current_x += meh[i+3] // dxc
+								let pv_x = current_x, pv_y = current_y
+								current_x += meh[i+4] // dxd
+								let c3_x = current_x, c3_y = current_y
+								current_x += meh[i+5] // dxe, dye
+								current_y += meh[i+6]
+								let c4_x = current_x, c4_y = current_y
+								current_y += meh[i+7] // dyf
+								line_to(c1_x, c1_y, 'vhc1')
+								line_to(c2_x, c2_y, 'vhc2')
+								line_to(pv_x, pv_y, 'vhpc')
+								line_to(c3_x, c3_y, 'vhc3')
+								line_to(c4_x, c4_y, 'vhc4')
+								s_x = current_x, s_y = current_y
+							}
+							if(i < meh.length) {
+								current_x += meh[i]
+							}
+							line_to(current_x, current_y, 'vhp2')
+						}
+						meh.length = 0
+					break
+					case 31:
+						cmd.push([`*hvcurveto-${offset}`, ...meh])
+						if((meh.length & 4) != 0) {
+							let p_x = current_x, p_y = current_y
+							current_x += meh[0]
+							let cp_1x = current_x, cp_1y = current_y
+							current_x += meh[1]
+							current_y += meh[2]
+							let cp_2x = current_x, cp_2y = current_y
+							current_y += meh[3]
+							let t_x = current_x, t_y = current_y
+							let cp_1mx = lerp(p_x, cp_1x, 0.75)
+							let cp_1my = lerp(p_y, cp_1y, 0.75)
+							let cp_2tx = lerp(cp_2x, t_x, 0.25)
+							let cp_2ty = lerp(cp_2y, t_y, 0.25)
+							make_the_last_point_into_curve_thing(cp_1mx, cp_1my)
+							//line_to(cp_1x, cp_1y, `hvc1-${offset}`)
+							//line_to(cp_2x, cp_2y, `hvc2-${offset}`)
+							line_to(lerp(cp_1mx, cp_2tx, 0.5), lerp(cp_1my, cp_2ty, 0.5), `hvm1-${offset}`)
+							//line_to(cp_2tx, cp_2ty, `hvc2t-${offset}`)
+							make_the_last_point_into_curve_thing(cp_2tx, cp_2ty)
+							let o = 4
+							if((o + 7) < meh.length) {
+								line_to(current_x, current_y, `hvpf1-${offset}`)
+								let sp_x = current_x // start point
+								let sp_y = current_y
+								let dya = meh[o] // cp v from start
+								current_y += dya
+								let cp_ax = current_x
+								let cp_ay = current_y
+								let dxb = meh[o+1]
+								let dyb = meh[o+2] // cp h from end
+								current_x += dxb
+								current_y += dyb
+								let cp_bx = current_x
+								let cp_by = current_y
+								let dxc = meh[o+3]
+								current_x += dxc
+								let p_cx = current_x // target coord
+								let p_cy = current_y
+								let cp_sax = lerp(sp_x, cp_ax, 0.75)
+								let cp_say = lerp(sp_y, cp_ay, 0.75)
+								let cp_bcx = lerp(cp_bx, p_cx, 0.25)
+								let cp_bcy = lerp(cp_by, p_cy, 0.25)
+								let mp_x = (cp_sax + cp_bcx) * 0.5
+								let mp_y = (cp_say + cp_bcy) * 0.5
+								make_the_last_point_into_curve_thing(cp_sax, cp_say)
+								//line_to(cp_ax, cp_ay, `hvca-${offset}`)
+								line_to(mp_x, mp_y, `hvm2-${offset}`)
+								make_the_last_point_into_curve_thing(cp_bcx, cp_bcy)
+								//line_to(cp_bx, cp_by, `hvcb-${offset}`)
+								line_to(p_cx, p_cy, `hvpc-${offset}`)
+								let dxd = meh[o+4] // cp h from start
+								current_x += dxd
+								line_to(current_x, current_y, `hvcd-${offset}`)
+								let dxe = meh[o+5] // target coordinate
+								let dye = meh[o+6]
+								current_x += dxe
+								current_y += dye
+								line_to(current_x, current_y, `hvce-${offset}`)
+								current_y += meh[o+7] // cp v/p from end
+								o += 8
+							}
+							if(o < meh.length) {
+								let dxf = meh[o]
+								current_x += dxf
+								// dxf, dyf control point
+							}
+							line_to(current_x, current_y, `hvpf2-${offset}`)
+						} else {
+							// the curves go the "other" way
+							// |- {dxa dxb dyb dyc dyd dxe dye dxf}+ dyf? hvcurveto (31)
+							let i = 0
+							let have_last = false
+							for(; (i + 7) < meh.length; i += 8) {
+								if(have_last) {
+									line_to(current_x, current_y, 'hvP1')
+								}
+								current_x += meh[i] // dxa
+								let c1_x = current_x, c1_y = current_y
+								current_x += meh[i+1] // dxb, dyb
+								current_y += meh[i+2]
+								let c2_x = current_x, c2_y = current_y
+								current_y += meh[i+3] // dyc
+								let pc_x = current_x, pc_y = current_y
+								current_y += meh[i+4] // dyd
+								let c3_x = current_x, c3_y = current_y
+								current_x += meh[i+5] // dxe, dye
+								current_y += meh[i+6]
+								let c4_x = current_x, c4_y = current_y
+								current_x += meh[i+7] // dxf
+								line_to(c1_x, c1_y, 'hvC1')
+								line_to(c2_x, c2_y, 'hvC2')
+								line_to(pc_x, pc_y, 'hvPC')
+								line_to(c3_x, c3_y, 'hvC3')
+								line_to(c4_x, c4_y, 'hvC4')
+								have_last = true
+							}
+							if(i < meh.length) {
+								current_y += meh[i] // dyf?
+							}
+							line_to(current_x, current_y, 'hvP2')
+						}
+						meh.length = 0
+					break
+					case 14:
+						cmd.push([`14endchar`, ...meh])
+						meh.length = 0
+						did_draw_one = true
+					break
+					default:
+						cmd.push([`op${v}`, ...meh])
+						meh.length = 0
 				}}
 			}
-			//console.log('CFF CharStrings#', index, 'len=', length, String(meh))
+			console.log('CFF CharStrings#', index, 'len=', length, num_of_mask_bytes, cmd)
 			number_of_charstrings_we_wasted_time_on++
 		})
 	}
@@ -866,14 +1396,14 @@ function parse_cff1(table: FontTable, cff_buf: Uint8Array) {
 	//
 }
 
-const parsers_for_font_things:{[i:string]:((t:FontTable, buf:Uint8Array)=>void)|undefined} = {
+const parsers_for_font_things:{[i:string]:((t:FontTable, buf:Uint8Array, raster?: raster.TheRasterThing)=>void)|undefined} = {
 	'head': parse_tt_head,
 	'name': parse_tt_name,
 	'CFF ': parse_cff1,
 	'cmap': parse_cmap,
 }
 
-export function load_font_outlines_from_ttf(font_array: ArrayBuffer) {
+export function load_font_outlines_from_ttf(font_array: ArrayBuffer, raster?: raster.TheRasterThing) {
 	let view = new DataView(font_array)
 	let font_buf = new Uint8Array(font_array)
 	console.log('      parsing font file', font_array.byteLength)
@@ -967,7 +1497,7 @@ export function load_font_outlines_from_ttf(font_array: ArrayBuffer) {
 		let maybe_parser = parsers_for_font_things[table.name]
 		if(maybe_parser) {
 			console.log(`look a font '${table.name}' table!`, table.checksum.toString(16).padStart(8,'0'), table.offset, table.length)
-			maybe_parser(table, buf)
+			maybe_parser(table, buf, raster)
 		} else {
 			console.log(`the '${table.name}' table is not implemented yet check=${table.checksum.toString(16).padStart(8,'0')}`, table.offset, table.length)
 		}
@@ -975,13 +1505,16 @@ export function load_font_outlines_from_ttf(font_array: ArrayBuffer) {
 }
 
 
-export async function get_the_font_data_pls() {
+export async function get_the_font_data_pls(r?: raster.TheRasterThing) {
 	let res = await fetch('NotoSerifCJK-Bold.ttc')
 	if(!res.ok) {
 		console.error('complaint: the font file was not downloadedable')
 		return
 	}
 	let font_array = await res.arrayBuffer()
-	load_font_outlines_from_ttf(font_array)
+	load_font_outlines_from_ttf(font_array, r)
+	if(r) {
+		r.rasterize()
+	}
 }
 
