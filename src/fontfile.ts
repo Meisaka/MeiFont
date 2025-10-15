@@ -409,7 +409,65 @@ function parse_cmap(table: FontTable & {cmap:any}, buf: Uint8Array) {
 	//console.log('cmap', table)
 }
 
-function parse_cff1(table: FontTable, cff_buf: Uint8Array, raster?: raster.TheRasterThing) {
+interface CFFTopDict {
+	cid_version: number,
+	cid_revision: number,
+	cid_count: number,
+	cid_fonttype: number,
+	cid_fontname?: string,
+	uid_base?: number,
+	fd_array?: CFFTopDict[],
+	fd_select_off?: number,
+	fd_select?: { first:number, fd: any, end:number }[],
+	ros?: {
+		registry: string,
+		ordering: string,
+		supplement: number,
+	},
+	italic_angle: number,
+	underline_position: number,
+	underline_thiccness: number,
+	paint_type: number,
+	charstring_type: number,
+	font_matrix: [number, number, number, number, number, number],
+	stroke_width: number,
+	is_fixed_pitch: boolean,
+	copyright?: string,
+	version?: string,
+	notice?: string,
+	fullname?: string,
+	family?: string,
+	weight?: string,
+	charset_off?:number,
+	encoding_off?:number,
+	charstrings?:CFFIndex,
+	draw_glyph_outline?: (index: number, x_offset: number, raster: raster.TheRasterThing) => void,
+	private_off?:number,
+	private?: {[i:string]: any},
+	unique_id?:number,
+	bounds: [number, number, number, number],
+	//[i:string]:any,
+}
+enum DictKind {
+	string = 0,
+	number,
+	bool,
+	SID,
+	INDEX,
+	ABS_INDEX, // relative to CFF start
+	DICT,
+	ARRAY,
+	Delta,
+}
+type DICT_ENTRY =
+	[string, DictKind] |
+	[string, DictKind, any] |
+	[string, DictKind.ARRAY, number] |
+	[string, DictKind.ARRAY, number, any] |
+	((context: any, args: any[], offset:number)=>void);
+type DICT_DEF = {[i:string]: DICT_ENTRY|undefined }
+
+function parse_cff1(table: FontTable, cff_buf: Uint8Array) {
 	function u32(offset: number) {
 		return cff_buf[offset] * 0x1000000 + cff_buf[offset+1] * 0x10000 + cff_buf[offset+2] * 0x100 + cff_buf[offset+3]
 	}
@@ -441,46 +499,15 @@ function parse_cff1(table: FontTable, cff_buf: Uint8Array, raster?: raster.TheRa
 		}
 		console.log('name offset', index, s, length, maybe_length)
 	})
-	interface CFFTopDict {
-		cid_version: number,
-		cid_revision: number,
-		cid_count: number,
-		cid_fonttype: number,
-		cid_fontname?: string,
-		uid_base?: number,
-		fd_array?: any[],
-		fd_select_off?: number,
-		fd_select?: { first:number, fd: any, end:number }[],
-		ros?: {
-			registry: string,
-			ordering: string,
-			supplement: number,
-		},
-		italic_angle: number,
-		underline_position: number,
-		underline_thiccness: number,
-		paint_type: number,
-		charstring_type: number,
-		font_matrix: [number, number, number, number, number, number],
-		stroke_width: number,
-		is_fixed_pitch: boolean,
-		copyright?: string,
-		version?: string,
-		notice?: string,
-		fullname?: string,
-		family?: string,
-		weight?: string,
-		charset_off?:number,
-		encoding_off?:number,
-		charstrings?:CFFIndex,
-		private_off?:number,
-		unique_id?:number,
-		bounds: [number, number, number, number],
-		//[i:string]:any,
-	}
 	let cff_top_dict_index = new CFFIndex(cff_buf, cff_name_index.after_offset)
 	let cff_strings_index = new CFFIndex(cff_buf, cff_top_dict_index.after_offset)
 	let cff_gsubrs_index = new CFFIndex(cff_buf, cff_strings_index.after_offset)
+	let cff_gsubr_bias = 32768
+	if(cff_gsubrs_index.count < 1240) {
+		cff_gsubr_bias = 107
+	} else if(cff_gsubrs_index.count < 33900) {
+		cff_gsubr_bias = 1131
+	}
 	function sid_lookup(sid: number): string {
 		if(sid > 390) {
 			sid -= 391
@@ -504,24 +531,6 @@ function parse_cff1(table: FontTable, cff_buf: Uint8Array, raster?: raster.TheRa
 	//   array are like, one or more numbers, eek
 	//   delta is a number or delta encoded array o' numbers
 	//   delta is ***fun***, just difference between number and hte last
-	enum DictKind {
-		string = 0,
-		number,
-		bool,
-		SID,
-		INDEX,
-		ABS_INDEX, // relative to CFF start
-		DICT,
-		ARRAY,
-		Delta,
-	}
-	type DICT_ENTRY =
-		[string, DictKind] |
-		[string, DictKind, any] |
-		[string, DictKind.ARRAY, number] |
-		[string, DictKind.ARRAY, number, any] |
-		((context: any, args: any[], offset:number)=>void);
-	type DICT_DEF = {[i:string]: DICT_ENTRY|undefined }
 	let private_dict_entries: DICT_DEF = {
 		6: ['blues', DictKind.Delta],
 		7: ['other_blues', DictKind.Delta],
@@ -737,9 +746,26 @@ function parse_cff1(table: FontTable, cff_buf: Uint8Array, raster?: raster.TheRa
 		console.log('DICT:', maybe_dict)
 		return maybe_dict
 	}
-	let last_top_dict: CFFTopDict = {} as CFFTopDict
+	let cff_fonts: CFFTopDict[] = []
+	table.fonts = cff_fonts
 	cff_top_dict_index.forEach(function(buf, offset:number, index:number, length:number) {
-		last_top_dict = load_dict(buf, offset, length, top_dict_entries)
+		let last_top_dict = load_dict(buf, offset, length, top_dict_entries)
+		if(last_top_dict.fd_array) {
+			for(let fdict of last_top_dict.fd_array) {
+				if(fdict.private) {
+					if(fdict.private.subrs) {
+						let n = (fdict.private.subrs as CFFIndex).count
+						if(n < 1240) {
+							fdict.private.subr_bias = 107
+						} else if(n < 33900) {
+							fdict.private.subr_bias = 1131
+						} else {
+							fdict.private.subr_bias = 32768
+						}
+					}
+				}
+			}
+		}
 		if(last_top_dict.ros && (last_top_dict.fd_select_off != undefined) && last_top_dict.fd_array) {
 			let fd_array = last_top_dict.fd_array
 			let offset = last_top_dict.fd_select_off
@@ -772,53 +798,37 @@ function parse_cff1(table: FontTable, cff_buf: Uint8Array, raster?: raster.TheRa
 			}
 		}
 		console.log('CFF Top DICT #', index, 'len=', length, last_top_dict)
-	})
-	let number_of_charstrings_we_wasted_time_on = 0
-	if(last_top_dict.charstrings != undefined) {
-		console.log('CFF CharStrings count', last_top_dict.charstrings.count)
-		let did_draw_one = false
-		let fd_select_index = 0
-		let fd_select = last_top_dict.fd_select || []
-		last_top_dict.charstrings.forEach((buf, offset, index, length) => {
-			while(fd_select_index < fd_select.length
-				&& index < fd_select[fd_select_index].first) {
-				fd_select_index++
-			}
-			if(did_draw_one) return;
-			if(index <= 5) return;
-			let meh:any[] = []
-			let cmd:any[] = []
-			let end = offset + length
-			let width = 0
-			let SCALE = 0.825
-			let XOFF = 200
-			let YOFF = 700
-			let hstems:any[] = []
-			let vstems:any[] = []
-			let num_of_mask_bytes = 0
-			let have_hstem = false
-			let have_vstem = false
-			let need_outline = true
+		cff_fonts.push(last_top_dict)
+		if(last_top_dict.charstrings == undefined) {
+			return
+		}
+		let charstrings = last_top_dict.charstrings
+		last_top_dict.draw_glyph_outline = (index: number, x_offset: number, raster: raster.TheRasterThing) => {
+			const SCALE = 0.125
+			const XOFF = 200 + x_offset
+			const YOFF = 200
+			const CURVE_FACTOR = 0.75
+			const meh:number[] = []
+			const callstack: { buf: Uint8Array, offset: number, end: number }[] = []
 			let current_x = 0, current_y = 0
 			let move_x = 0, move_y = 0, moved = true
+			let last_x = 0, last_y = 0
 			let last_point: raster.ShapePoint | undefined
 			let line_to = (x: number, y: number, tag?: string) => {
-				if(raster) {
-					if(moved) {
-						raster.add_outline()
-						raster.add_point(XOFF+SCALE*move_x, YOFF-SCALE*move_y, 'move')
-						moved = false
-					}
-					last_point = raster.add_point(XOFF+SCALE*x, YOFF-SCALE*y, tag)
+				if(moved) {
+					raster.add_outline()
+					raster.add_point(XOFF+SCALE*move_x, YOFF-SCALE*move_y, 'move')
+					moved = false
 				}
+				last_x = x; last_y = y
+				last_point = raster.add_point(XOFF+SCALE*x, YOFF-SCALE*y, tag)
 			}
 			let make_the_last_point_into_curve_thing = (x: number, y: number) => {
-				if(!raster) {
-					return
-				}
 				if(!last_point) {
 					if(moved) {
 						raster.add_outline()
+						last_x = move_x
+						last_y = move_y
 						last_point = raster.add_point(XOFF+SCALE*move_x, YOFF-SCALE*move_y, 'move')
 						moved = false
 					} else {
@@ -830,6 +840,48 @@ function parse_cff1(table: FontTable, cff_buf: Uint8Array, raster?: raster.TheRa
 					last_point.curve_type = ShapePointKind.Quadradic
 				}
 			}
+			let multipoint_curve_to = (c1x: number, c1y: number, c2x: number, c2y: number, px: number, py: number, tag?: string) => {
+				if(moved) {
+					raster.add_outline()
+					last_x = move_x
+					last_y = move_y
+					last_point = raster.add_point(XOFF+SCALE*move_x, YOFF-SCALE*move_y, 'move')
+					moved = false
+				}
+				if(!last_point) {
+					return
+				}
+				let cp_sax = lerp(last_x, c1x, CURVE_FACTOR)
+				let cp_say = lerp(last_y, c1y, CURVE_FACTOR)
+				let cp_bcx = lerp(c2x, px, 1 - CURVE_FACTOR)
+				let cp_bcy = lerp(c2y, py, 1 - CURVE_FACTOR)
+				let mp_x = (cp_sax + cp_bcx) * 0.5
+				let mp_y = (cp_say + cp_bcy) * 0.5
+				make_the_last_point_into_curve_thing(cp_sax, cp_say)
+				last_point = raster.add_point(XOFF+SCALE*mp_x, YOFF-SCALE*mp_y, tag != undefined ? `${tag}-mp` : undefined)
+				make_the_last_point_into_curve_thing(cp_bcx, cp_bcy)
+				last_x = px; last_y = py
+				last_point = raster.add_point(XOFF+SCALE*px, YOFF-SCALE*py, tag)
+			}
+			let fd_select_index = 0
+			let fd_select = last_top_dict.fd_select || []
+			let fd_range = fd_select[0]
+			while(fd_range
+				&& (index < fd_range.first || index > fd_range.end)) {
+				fd_range = fd_select[++fd_select_index]
+			}
+			let active_priv:any = fd_range?.fd?.private
+			console.log(`fd_select for #${index}:`, fd_select_index, index, fd_select[fd_select_index]?.first, fd_select[fd_select_index]?.end, active_priv)
+			let cmd:any[] = []
+			let offset = charstrings.item_offset(index)
+			let end = charstrings.item_offset(index+1)
+			let buf = charstrings.buf
+			let width = 0
+			let hstems:any[] = []
+			let vstems:any[] = []
+			let num_of_mask_bytes = 0
+			let have_hstem = false
+			let have_vstem = false
 			let eat_the_implicit_vstem_values_pls = () => {
 				for(let i = 0; i < meh.length; i+= 2) {
 					vstems.push({vs:meh[i], ve:meh[i+1]})
@@ -846,9 +898,9 @@ function parse_cff1(table: FontTable, cff_buf: Uint8Array, raster?: raster.TheRa
 			for(; offset < end; ) {
 				let v = buf[offset++]
 				if(v == 0) {
-					meh.push('EVIL')
+					//meh.push('EVIL')
 					console.error(`the CFF CharString ${index} @ ${offset} is full of pure EVIL, and must be purged`)
-					//throw new EEKError(`the CFF CharStrings are full of pure EVIL, and must be purged`)
+					throw new EEKError(`the CFF CharStrings are full of pure EVIL, and must be purged`)
 				} else if(v == 12) {
 					if(offset >= end) break
 					let v1 = buf[offset++]
@@ -883,6 +935,10 @@ function parse_cff1(table: FontTable, cff_buf: Uint8Array, raster?: raster.TheRa
 					if(offset >= end) break
 					let v1 = buf[offset++]
 					meh.push((v - 251) * -256 - v1 - 108)
+				} else if(v == 14) {
+					cmd.push([`14endchar`, ...meh])
+					meh.length = 0
+					break
 				} else {switch(v) {
 					case 1:
 						if((meh.length & 1) != 0) {
@@ -980,35 +1036,47 @@ function parse_cff1(table: FontTable, cff_buf: Uint8Array, raster?: raster.TheRa
 						cmd.push(['*rrcurveto', ...meh])
 						let o = 0
 						for(; (o+5) < meh.length; o+= 6) {
-							let s_x = current_x, s_y = current_y
 							current_x += meh[o]
 							current_y += meh[o+1]
-							let c1_x = current_x, c1_y = current_y
+							let c1x = current_x, c1y = current_y
 							current_x += meh[o+2]
 							current_y += meh[o+3]
-							let c2_x = current_x, c2_y = current_y
+							let c2x = current_x, c2y = current_y
 							current_x += meh[o+4]
 							current_y += meh[o+5]
-							let e_x = current_x, e_y = current_y
-							line_to(c1_x, c1_y, 'rrc1')
-							line_to(c2_x, c2_y, 'rrc2')
-							line_to(e_x, e_y, 'rrc3')
+							multipoint_curve_to(c1x, c1y, c2x, c2y, current_x, current_y, 'rr')
 						}
 						meh.length = 0
 					} break
-					case 10:
-						cmd.push(['10callsubr', ...meh])
-						meh.length = 0
-						if(!have_hstem || !have_vstem) {
-							console.warn('callsubr without stems defined')
+					case 10: {
+						cmd.push(['callsubr', ...meh])
+						let n = meh.pop() as (undefined | number)
+						if(n == undefined) {
+							throw new EEKError('callsubr without subr#')
 						}
-						return
-						//console.warn('callsubr without a local subroutine table')
-					break
-					case 11:
-						cmd.push(['11return', ...meh])
-						meh.length = 0
-					break
+						let subrs: CFFIndex | undefined = active_priv?.subrs
+						if(subrs == undefined) {
+							throw new EEKError('callsubr without local subr table')
+						}
+						n += active_priv.subr_bias as number
+						if(n < 0 || n >= subrs.count) {
+							throw new EEKError('callsubr out of range')
+						}
+						callstack.push({ buf, offset, end })
+						buf = subrs.buf
+						offset = subrs.item_offset(n)
+						end = subrs.item_offset(n+1)
+					} break
+					case 11: {
+						cmd.push(['return', ...meh])
+						let r = callstack.pop()
+						if(!r) {
+							throw new EEKError('the return from hell')
+						}
+						buf = r.buf
+						offset = r.offset
+						end = r.end
+					} break
 					case 18:
 						if(!have_hstem) {
 							if((meh.length & 1) != 0) {
@@ -1087,19 +1155,58 @@ function parse_cff1(table: FontTable, cff_buf: Uint8Array, raster?: raster.TheRa
 						have_vstem = true
 						have_hstem = true
 					break
-					case 24:
-						cmd.push(['24rcurveline', [...meh]])
+					case 24: {
+						// |- {dxa dya dxb dyb dxc dyc}+ dxd dyd rcurveline (24)
+						cmd.push(['*rcurveline', ...meh])
+						let len = meh.length - 2
+						if(len < 6) {
+							throw new EEKError('rcurveline missing args')
+						}
+						let i = 0
+						for(; i < len; i += 6) {
+							current_x += meh[i]
+							current_y += meh[i+1]
+							let c1x = current_x, c1y = current_y
+							current_x += meh[i+2]
+							current_y += meh[i+3]
+							let c2x = current_x, c2y = current_y
+							current_x += meh[i+4]
+							current_y += meh[i+5]
+							multipoint_curve_to(c1x, c1y, c2x, c2y, current_x, current_y, 'rcl')
+						}
+						current_x += meh[i]
+						current_y += meh[i+1]
+						line_to(current_x, current_y, 'rcl')
 						meh.length = 0
-					break
-					case 25:
-						cmd.push(['25rlinecurve', [...meh]])
+					} break
+					case 25: {
+						// |- {dxa dya}+ dxb dyb dxc dyc dxd dyd rlinecurve (25)
+						cmd.push(['*rlinecurve', ...meh])
+						let len = meh.length - 6
+						if(len < 2) {
+							throw new EEKError('rlinecurve missing args')
+						}
+						let i = 0
+						for(; i < len; i += 2) {
+							current_x += meh[i]
+							current_y += meh[i+1]
+							line_to(current_x, current_y, 'rlc')
+						}
+						current_x += meh[i]
+						current_y += meh[i+1]
+						let c1x = current_x, c1y = current_y
+						current_x += meh[i+2]
+						current_y += meh[i+3]
+						let c2x = current_x, c2y = current_y
+						current_x += meh[i+4]
+						current_y += meh[i+5]
+						multipoint_curve_to(c1x, c1y, c2x, c2y, current_x, current_y, 'rr')
 						meh.length = 0
-					break
+					} break
 					case 26: {
 						cmd.push(['*vvcurveto', ...meh])
-						let s_x = current_x, s_y = current_y
 						if((meh.length & 1) != 0) {
-							current_x += meh.shift() // dx1
+							current_x += meh.shift()! // dx1
 						}
 						let i = 0
 						for(;(i + 3) < meh.length; i+=4) {
@@ -1110,9 +1217,7 @@ function parse_cff1(table: FontTable, cff_buf: Uint8Array, raster?: raster.TheRa
 							let c2_x = current_x, c2_y = current_y
 							current_y += meh[i+3] // dyc
 							let e_x = current_x, e_y = current_y
-							line_to(c1_x, c1_y, 'vvc1')
-							line_to(c2_x, c2_y, 'vvc2')
-							line_to(e_x, e_y, 'vvpc')
+							multipoint_curve_to(c1_x, c1_y, c2_x, c2_y, e_x, e_y, 'vv')
 						}
 						meh.length = 0
 					} break
@@ -1120,224 +1225,173 @@ function parse_cff1(table: FontTable, cff_buf: Uint8Array, raster?: raster.TheRa
 						cmd.push(['*hhcurveto', ...meh])
 						let dya = 0
 						if((meh.length & 1) != 0) {
-							dya = meh.shift()
+							dya = meh.shift()!
 							current_y += dya
 						}
 						let i = 0
-						while((i+3) < meh.length) {
-							let dxa = meh[0+i] // cp start?
-							let dxb = meh[1+i] // target
-							let dyb = meh[2+i]
-							let dxc = meh[3+i] // cp ending
-							current_x += dxa
-							line_to(current_x, current_y, 'hhc1') // cp?
-							current_x += dxb
-							current_y += dyb
-							line_to(current_x, current_y, 'hhc2')
-							current_x += dxc
-							line_to(current_x, current_y, 'hhp')
-							// TODO set the controls
-							i += 4
+						for(;(i+3) < meh.length; i += 4) {
+							current_x += meh[0+i]
+							let c1x = current_x, c1y = current_y
+							current_x += meh[1+i]
+							current_y += meh[2+i]
+							let c2x = current_x, c2y = current_y
+							current_x += meh[3+i]
+							multipoint_curve_to(c1x, c1y, c2x, c2y, current_x, current_y, 'hh')
 						}
 						meh.length = 0
 					break
-					case 29:
-						cmd.push(['29callgsubr', ...meh])
-						meh.length = 0
-						if(!have_hstem || !have_vstem) {
-							console.warn('callsubr without stems defined')
+					case 29: {
+						cmd.push(['callgsubr', ...meh])
+						let n = meh.pop() as (undefined | number)
+						if(n == undefined) {
+							throw new EEKError('callgsubr without subr#')
 						}
-						return
-					break
+						n += cff_gsubr_bias
+						if(n < 0 || n >= cff_gsubrs_index.count) {
+							throw new EEKError('callgsubr out of range')
+						}
+						callstack.push({ buf, offset, end })
+						buf = cff_gsubrs_index.buf
+						offset = cff_gsubrs_index.item_offset(n)
+						end = cff_gsubrs_index.item_offset(n+1)
+					} break
 					case 30:
 						cmd.push(['*vhcurveto', ...meh])
 						if((meh.length & 4) != 0) {
-							let p_x = current_x, p_y = current_y
 							current_y += meh[0] // dy1
-							let c1_x = current_x, c1_y = current_y
+							let c1x = current_x
+							let c1y = current_y
 							current_x += meh[1] // dx2, dy2
 							current_y += meh[2]
-							let c2_x = current_x, c2_y = current_y
+							let c2x = current_x
+							let c2y = current_y
 							current_x += meh[3] // dx3
-							let s_x = current_x, s_y = current_y
-							line_to(c1_x, c1_y, 'vhc1')
-							line_to(c2_x, c2_y, 'vhc2')
 							let i = 4
 							// |- dy1 dx2 dy2 dx3
 							// {dxa dxb dyb dyc dyd dxe dye dxf}* dyf? 
 							// vhcurveto (30) |-
 							for(;(i+7) < meh.length; i += 8) {
-								line_to(current_x, current_y, 'vhpf')
-								s_x = current_x
-								s_y = current_y
+								multipoint_curve_to(c1x, c1y, c2x, c2y, current_x, current_y, 'vhc1')
 								current_x += meh[0+i] // dxa
-								let ca_x = current_x, ca_y = current_y
+								c1x = current_x
+								c1y = current_y
 								current_x += meh[1+i] // dxb dyb
 								current_y += meh[2+i]
-								let cb_x = current_x, cb_y = current_y
+								c2x = current_x
+								c2y = current_y
 								current_y += meh[3+i] // dyc
-								let pc_x = current_x, pc_y = current_y
+								multipoint_curve_to(c1x, c1y, c2x, c2y, current_x, current_y, 'vhc2')
 								current_y += meh[4+i] // dyd
-								let cd_x = current_x, cd_y = current_y
+								c1x = current_x, c1y = current_y
 								current_x += meh[5+i] // dxe dye
 								current_y += meh[6+i]
-								let ce_x = current_x, ce_y = current_y
+								c2x = current_x, c2y = current_y
 								current_x += meh[7+i] // dxf
-								line_to(ca_x, ca_y, 'vhca')
-								line_to(cb_x, cb_y, 'vhcb')
-								line_to(pc_x, pc_y, 'vhpc')
-								line_to(cd_x, cd_y, 'vhcd')
-								line_to(ce_x, ce_y, 'vhce')
 							}
 							if(i < meh.length) {
 								current_y += meh[i]
 							}
-							line_to(current_x, current_y, 'vhpf')
+							multipoint_curve_to(c1x, c1y, c2x, c2y, current_x, current_y, 'vhf3')
 						} else { // length by 8 or 9
 							// {dya dxb dyb dxc dxd dxe dye dyf}+ dxf?
 							let i = 0
 							let has_last = false
-							let s_x = current_x, s_y = current_y
+							let c1x = 0, c1y = 0, c2x = 0, c2y = 0
 							for(;(i+7) < meh.length; i += 8) {
 								if(has_last) {
-									line_to(s_x, s_y, 'vhpf')
+									multipoint_curve_to(c1x, c1y, c2x, c2y, current_x, current_y, 'vhC2')
 								}
 								current_y += meh[i] // dya
-								let c1_x = current_x, c1_y = current_y
+								c1x = current_x, c1y = current_y
 								current_x += meh[i+1] // dxb, dyb
 								current_y += meh[i+2]
-								let c2_x = current_x, c2_y = current_y
+								c2x = current_x, c2y = current_y
 								current_x += meh[i+3] // dxc
-								let pv_x = current_x, pv_y = current_y
+								multipoint_curve_to(c1x, c1y, c2x, c2y, current_x, current_y, 'vhC1')
 								current_x += meh[i+4] // dxd
-								let c3_x = current_x, c3_y = current_y
+								c1x = current_x, c1y = current_y
 								current_x += meh[i+5] // dxe, dye
 								current_y += meh[i+6]
-								let c4_x = current_x, c4_y = current_y
+								c2x = current_x, c2y = current_y
 								current_y += meh[i+7] // dyf
-								line_to(c1_x, c1_y, 'vhc1')
-								line_to(c2_x, c2_y, 'vhc2')
-								line_to(pv_x, pv_y, 'vhpc')
-								line_to(c3_x, c3_y, 'vhc3')
-								line_to(c4_x, c4_y, 'vhc4')
-								s_x = current_x, s_y = current_y
+								has_last = true
 							}
 							if(i < meh.length) {
 								current_x += meh[i]
 							}
-							line_to(current_x, current_y, 'vhp2')
+							multipoint_curve_to(c1x, c1y, c2x, c2y, current_x, current_y, 'vhF3')
 						}
 						meh.length = 0
 					break
 					case 31:
 						cmd.push([`*hvcurveto-${offset}`, ...meh])
 						if((meh.length & 4) != 0) {
-							let p_x = current_x, p_y = current_y
 							current_x += meh[0]
-							let cp_1x = current_x, cp_1y = current_y
+							let c1x = current_x, c1y = current_y
 							current_x += meh[1]
 							current_y += meh[2]
-							let cp_2x = current_x, cp_2y = current_y
+							let c2x = current_x, c2y = current_y
 							current_y += meh[3]
-							let t_x = current_x, t_y = current_y
-							let cp_1mx = lerp(p_x, cp_1x, 0.75)
-							let cp_1my = lerp(p_y, cp_1y, 0.75)
-							let cp_2tx = lerp(cp_2x, t_x, 0.25)
-							let cp_2ty = lerp(cp_2y, t_y, 0.25)
-							make_the_last_point_into_curve_thing(cp_1mx, cp_1my)
-							//line_to(cp_1x, cp_1y, `hvc1-${offset}`)
-							//line_to(cp_2x, cp_2y, `hvc2-${offset}`)
-							line_to(lerp(cp_1mx, cp_2tx, 0.5), lerp(cp_1my, cp_2ty, 0.5), `hvm1-${offset}`)
-							//line_to(cp_2tx, cp_2ty, `hvc2t-${offset}`)
-							make_the_last_point_into_curve_thing(cp_2tx, cp_2ty)
 							let o = 4
-							if((o + 7) < meh.length) {
-								line_to(current_x, current_y, `hvpf1-${offset}`)
-								let sp_x = current_x // start point
-								let sp_y = current_y
-								let dya = meh[o] // cp v from start
-								current_y += dya
-								let cp_ax = current_x
-								let cp_ay = current_y
-								let dxb = meh[o+1]
-								let dyb = meh[o+2] // cp h from end
-								current_x += dxb
-								current_y += dyb
-								let cp_bx = current_x
-								let cp_by = current_y
-								let dxc = meh[o+3]
-								current_x += dxc
-								let p_cx = current_x // target coord
-								let p_cy = current_y
-								let cp_sax = lerp(sp_x, cp_ax, 0.75)
-								let cp_say = lerp(sp_y, cp_ay, 0.75)
-								let cp_bcx = lerp(cp_bx, p_cx, 0.25)
-								let cp_bcy = lerp(cp_by, p_cy, 0.25)
-								let mp_x = (cp_sax + cp_bcx) * 0.5
-								let mp_y = (cp_say + cp_bcy) * 0.5
-								make_the_last_point_into_curve_thing(cp_sax, cp_say)
-								//line_to(cp_ax, cp_ay, `hvca-${offset}`)
-								line_to(mp_x, mp_y, `hvm2-${offset}`)
-								make_the_last_point_into_curve_thing(cp_bcx, cp_bcy)
-								//line_to(cp_bx, cp_by, `hvcb-${offset}`)
-								line_to(p_cx, p_cy, `hvpc-${offset}`)
-								let dxd = meh[o+4] // cp h from start
-								current_x += dxd
-								line_to(current_x, current_y, `hvcd-${offset}`)
-								let dxe = meh[o+5] // target coordinate
-								let dye = meh[o+6]
-								current_x += dxe
-								current_y += dye
-								line_to(current_x, current_y, `hvce-${offset}`)
-								current_y += meh[o+7] // cp v/p from end
-								o += 8
+							for(;(o + 7) < meh.length; o += 8) {
+								multipoint_curve_to(c1x, c1y, c2x, c2y, current_x, current_y, `hvf1-${offset}`)
+								current_y += meh[o] // dya / cp v from start
+								c1x = current_x
+								c1y = current_y
+								current_x += meh[o+1] // dxb, dyb
+								current_y += meh[o+2] // cp h from end
+								c2x = current_x
+								c2y = current_y
+								current_x += meh[o+3] // dxc
+								multipoint_curve_to(c1x, c1y, c2x, c2y, current_x, current_y, `hvc1-${offset}`)
+								current_x += meh[o+4] // dxd, cp h from start
+								c1x = current_x
+								c1y = current_y
+								current_x += meh[o+5]
+								current_y += meh[o+6]
+								c2x = current_x
+								c2y = current_y
+								current_y += meh[o+7] // end
 							}
 							if(o < meh.length) {
 								let dxf = meh[o]
 								current_x += dxf
-								// dxf, dyf control point
+								// dxf, dyf point
 							}
-							line_to(current_x, current_y, `hvpf2-${offset}`)
+							multipoint_curve_to(c1x, c1y, c2x, c2y, current_x, current_y, `hvf2-${offset}`)
 						} else {
 							// the curves go the "other" way
 							// |- {dxa dxb dyb dyc dyd dxe dye dxf}+ dyf? hvcurveto (31)
 							let i = 0
 							let have_last = false
+							let c1x = 0, c1y = 0, c2x = 0, c2y = 0
 							for(; (i + 7) < meh.length; i += 8) {
 								if(have_last) {
-									line_to(current_x, current_y, 'hvP1')
+									multipoint_curve_to(c1x, c1y, c2x, c2y, current_x, current_y, `hvC1-${offset}`)
 								}
 								current_x += meh[i] // dxa
-								let c1_x = current_x, c1_y = current_y
+								c1x = current_x, c1y = current_y
 								current_x += meh[i+1] // dxb, dyb
 								current_y += meh[i+2]
-								let c2_x = current_x, c2_y = current_y
+								c2x = current_x, c2y = current_y
 								current_y += meh[i+3] // dyc
-								let pc_x = current_x, pc_y = current_y
+								multipoint_curve_to(c1x, c1y, c2x, c2y, current_x, current_y, `hvC2-${offset}`)
 								current_y += meh[i+4] // dyd
-								let c3_x = current_x, c3_y = current_y
+								c1x = current_x
+								c1y = current_y
 								current_x += meh[i+5] // dxe, dye
 								current_y += meh[i+6]
-								let c4_x = current_x, c4_y = current_y
+								c2x = current_x
+								c2y = current_y
 								current_x += meh[i+7] // dxf
-								line_to(c1_x, c1_y, 'hvC1')
-								line_to(c2_x, c2_y, 'hvC2')
-								line_to(pc_x, pc_y, 'hvPC')
-								line_to(c3_x, c3_y, 'hvC3')
-								line_to(c4_x, c4_y, 'hvC4')
 								have_last = true
 							}
 							if(i < meh.length) {
 								current_y += meh[i] // dyf?
 							}
-							line_to(current_x, current_y, 'hvP2')
+							multipoint_curve_to(c1x, c1y, c2x, c2y, current_x, current_y, `hvC3-${offset}`)
 						}
 						meh.length = 0
-					break
-					case 14:
-						cmd.push([`14endchar`, ...meh])
-						meh.length = 0
-						did_draw_one = true
 					break
 					default:
 						cmd.push([`op${v}`, ...meh])
@@ -1345,10 +1399,8 @@ function parse_cff1(table: FontTable, cff_buf: Uint8Array, raster?: raster.TheRa
 				}}
 			}
 			console.log('CFF CharStrings#', index, 'len=', length, num_of_mask_bytes, cmd)
-			number_of_charstrings_we_wasted_time_on++
-		})
-	}
-	console.log('CFF CharStrings processed', number_of_charstrings_we_wasted_time_on)
+		}
+	})
 	// data layout:
 	// - Header
 	// version: u8 major . u8 minor
@@ -1403,7 +1455,7 @@ const parsers_for_font_things:{[i:string]:((t:FontTable, buf:Uint8Array, raster?
 	'cmap': parse_cmap,
 }
 
-export function load_font_outlines_from_ttf(font_array: ArrayBuffer, raster?: raster.TheRasterThing) {
+export function load_font_outlines_from_ttf(font_array: ArrayBuffer) {
 	let view = new DataView(font_array)
 	let font_buf = new Uint8Array(font_array)
 	console.log('      parsing font file', font_array.byteLength)
@@ -1438,6 +1490,7 @@ export function load_font_outlines_from_ttf(font_array: ArrayBuffer, raster?: ra
 		}
 	}
 	let tables: FontTable[] = []
+	let fonts:any[] = []
 	for(let font_index = 0; font_index < file_number_o_fonts; font_index++) {
 		let font_offset = u32(12 + (font_index * 4))
 		if((font_offset + 12) >= font_array.byteLength) {
@@ -1449,6 +1502,8 @@ export function load_font_outlines_from_ttf(font_array: ArrayBuffer, raster?: ra
 			console.error(EEK, 'font looks too funny, unsure what it is', font_version.toString(16).padStart(8, '0'))
 			return
 		}
+		let the_font:any = {}
+		fonts.push(the_font)
 		let font_num_tables = u16(font_offset+4)
 		let font_search_range_thing = u16(font_offset+6)
 		let font_entry_selector_thing = u16(font_offset+8)
@@ -1483,13 +1538,15 @@ export function load_font_outlines_from_ttf(font_array: ArrayBuffer, raster?: ra
 				&& (v.offset === table_offset)
 				&& (v.length === table_length))
 			if(!existing_table) {
-				tables.push({
+				existing_table = {
 					name: table_tag_name,
 					checksum: table_checksum,
 					offset: table_offset,
 					length: table_length,
-				})
+				}
+				tables.push(existing_table)
 			}
+			the_font[existing_table.name] = existing_table
 		}
 	}
 	for(let table of tables) {
@@ -1497,11 +1554,12 @@ export function load_font_outlines_from_ttf(font_array: ArrayBuffer, raster?: ra
 		let maybe_parser = parsers_for_font_things[table.name]
 		if(maybe_parser) {
 			console.log(`look a font '${table.name}' table!`, table.checksum.toString(16).padStart(8,'0'), table.offset, table.length)
-			maybe_parser(table, buf, raster)
+			maybe_parser(table, buf)
 		} else {
 			console.log(`the '${table.name}' table is not implemented yet check=${table.checksum.toString(16).padStart(8,'0')}`, table.offset, table.length)
 		}
 	}
+	return fonts
 }
 
 
@@ -1512,9 +1570,27 @@ export async function get_the_font_data_pls(r?: raster.TheRasterThing) {
 		return
 	}
 	let font_array = await res.arrayBuffer()
-	load_font_outlines_from_ttf(font_array, r)
-	if(r) {
-		r.rasterize()
+	let fonts = load_font_outlines_from_ttf(font_array)
+	let main_font = fonts?.[0]
+	if(r && main_font) {
+		let bleh = document.getElementById('bleh') as HTMLInputElement
+		bleh.addEventListener('input', () => {
+			let value = bleh.value
+			let cff = main_font['CFF ']?.fonts?.[0]
+			r.outlines.length = 0
+			r.active_point = -1
+			let advance = 0
+			if(cff?.draw_glyph_outline && r) {
+				for(let c of value) {
+					let codepoint = c.codePointAt(0)!
+					let cmap:number = main_font?.cmap?.cmap?.unicode_bmp?.[codepoint] ?? 0
+					cff.draw_glyph_outline(cmap, advance, r)
+					advance += 100
+				}
+			}
+			r.active_outline = undefined
+			r.rasterize()
+		})
 	}
 }
 
